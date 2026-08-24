@@ -5,16 +5,17 @@
 #include <stdarg.h>
 
 /* ── Configuration ─────────────────────────────────────────── */
-#define F_CPU       16000000UL
-#define BAUD        115200UL
-#define LED_PIN     5
-#define BTN_PIN     2
+#define F_CPU   16000000UL
+#define BAUD    115200UL
+#define LED_PIN 5
+#define BTN_PIN 2
 
 /* ── Macros ────────────────────────────────────────────────── */
-#define SET_BIT(r,b)      ((r) |=   (1<<(b)))
-#define CLEAR_BIT(r,b)    ((r) &=  ~(1<<(b)))
-#define TOGGLE_BIT(r,b)   ((r) ^=   (1<<(b)))
-#define READ_BIT(r,b)     (((r)>>(b))&1)
+#define SET_BIT(r,b)    ((r) |=  (1<<(b)))
+#define CLEAR_BIT(r,b)  ((r) &= ~(1<<(b)))
+#define TOGGLE_BIT(r,b) ((r) ^=  (1<<(b)))
+#define READ_BIT(r,b)   (((r)>>(b))&1)
+#define UART_RX_BUFFER_SIZE 64
 
 /* ── System state ───────────────────────────────────────────── */
 volatile uint32_t ms_ticks = 0;
@@ -25,8 +26,16 @@ typedef enum {
     SYS_ERROR
 } SystemState;
 
-static SystemState  sys_state   = SYS_IDLE;
-static uint32_t     loop_count  = 0;
+typedef struct {
+    uint8_t data[UART_RX_BUFFER_SIZE];
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
+} CircularBuffer;
+
+static SystemState sys_state  = SYS_IDLE;
+static uint32_t    loop_count = 0;
+static CircularBuffer uart_rx_buffer;
 
 /* ── Timer0 ISR ─────────────────────────────────────────────── */
 ISR(TIMER0_COMPA_vect) {
@@ -76,14 +85,52 @@ void uart_send_uint32(uint32_t val) {
     uint8_t idx = 0;
     if (val == 0) { uart_send_byte('0'); return; }
     while (val > 0) { buf[idx++] = '0' + (val % 10); val /= 10; }
-    while (idx > 0) uart_send_byte((uint8_t)buf[--idx]);
+    while (idx > 0) uart_send_byte((uint8_t) buf[--idx]);
 }
 
-void uart_send_hex(uint8_t val) {
+void uart_send_hex8(uint8_t val) {
     const char h[] = "0123456789ABCDEF";
     uart_send_byte('0'); uart_send_byte('x');
     uart_send_byte((uint8_t)h[(val >> 4) & 0xF]);
     uart_send_byte((uint8_t)h[val & 0xF]);
+}
+
+void uart_send_binary8(uint8_t val) {
+    for (int8_t i = 7; i >= 0; i--) {
+        uart_send_byte((val & (1 << i)) ? '1' : '0');
+    }
+}
+
+void buffer_init(CircularBuffer *rb) {
+    rb->head = rb->tail = rb->count = 0;
+}
+
+uint8_t buffer_is_empty(CircularBuffer *rb) {
+    return rb->count == 0;
+}
+
+uint8_t buffer_is_full(CircularBuffer *rb) {
+    return rb->count == UART_RX_BUFFER_SIZE;
+}
+
+uint8_t buffer_write(CircularBuffer *rb, uint8_t value) {
+    if (!buffer_is_full(rb)) {
+        rb->data[rb->tail] = value;
+        rb->tail = (rb->tail + 1) % UART_RX_BUFFER_SIZE;
+        rb->count++;
+        return 1;
+    }
+    return 0;
+}
+
+uint8_t buffer_read(CircularBuffer *rb, uint8_t *value) {
+    if (!buffer_is_empty(rb)) {
+        *value = rb->data[rb->head];
+        rb->head = (rb->head + 1) % UART_RX_BUFFER_SIZE;
+        rb->count--;
+        return 1;
+    }
+    return 0;
 }
 
 void uart_printf(const char *fmt, ...) {
@@ -93,11 +140,12 @@ void uart_printf(const char *fmt, ...) {
         if (*fmt == '%') {
             fmt++;
             switch (*fmt) {
-                case 'u': uart_send_uint32(va_arg(args, unsigned int)); break;
-                case 'x': uart_send_hex((uint8_t)va_arg(args, int)); break;
-                case 's': uart_send_string(va_arg(args, char *)); break;
-                case 'c': uart_send_byte((uint8_t)va_arg(args, int)); break;
-                case '%': uart_send_byte('%'); break;
+                case 'b': uart_send_binary8 ((uint8_t) va_arg(args,int)); break;
+                case 'u': uart_send_uint32 (va_arg(args, uint32_t));      break;
+                case 'x': uart_send_hex8 ((uint8_t) va_arg(args,int));    break;
+                case 's': uart_send_string (va_arg(args, char *));        break;
+                case 'c': uart_send_byte ((uint8_t) va_arg(args,int));    break;
+                case '%': uart_send_byte ('%');                           break;
             }
         } else {
             uart_send_byte((uint8_t)*fmt);
@@ -163,34 +211,48 @@ int main(void) {
     gpio_init();
     timer0_init();
     uart_init();
+    buffer_init(&uart_rx_buffer); 
+    uart_printf("DDRB after init = %x\r\n", DDRB);
 
     uart_printf("\r\n=== UART Debug Console ===\r\n");
     uart_printf("Type ? for commands\r\n\r\n");
 
-    uint32_t last_report    = 0;
-    uint32_t last_blink     = 0;
+    uint32_t last_report = 0;
+    uint32_t last_blink  = 0;
 
     while (1) {
         uint32_t now = millis_get();
 
         /* Receive and handle commands */
+        // Fill buffer from UART (polling the hardware)
         if (uart_available()) {
-            uint8_t cmd = uart_read_byte();
-            /* uart_printf("[RX] Got: %c\r\n", cmd); */
+            uint8_t byte = uart_read_byte();
+            if (!buffer_write(&uart_rx_buffer, byte)) {
+                uart_printf("[ERR] RX buffer overflow\r\n");
+            }
+        }
+
+        // Process commands from buffer (logic layer)
+        uint8_t cmd;
+        if (buffer_read(&uart_rx_buffer, &cmd)) {
+            uart_printf("[BUFFER] queue depth now: %u\r\n", uart_rx_buffer.count);
+            if (cmd != '\r' && cmd != '\n') {
+                uart_printf("[RX] Got: %c\r\n", cmd);
+            }
             handle_command(cmd);
         }
 
         /* Report system status every 2 seconds */
         if (now - last_report >= 2000) {
-            uart_printf("[STATUS] time=%u ms | state=%u | loops=%u | PORTB=%x\r\n",
-                        now, (unsigned)sys_state, loop_count, PORTB);
+            uart_printf("[STATUS] time=%u ms | state=%u | loops=%u | PORTB=%b\r\n",
+                        now, (uint32_t)sys_state, loop_count, (uint8_t)PORTB);
             last_report = now;
         }
 
         /* Blink LED based on state */
         uint32_t blink_interval = (sys_state == SYS_RUNNING) ? 200 :
-                                    (sys_state == SYS_ERROR) ? 100 : 1000;
-        
+                                  (sys_state == SYS_ERROR) ? 100 : 1000;
+
         if (now - last_blink >= blink_interval) {
             TOGGLE_BIT(PORTB, LED_PIN);
             last_blink = now;
